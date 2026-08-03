@@ -10,11 +10,13 @@
 - AMD Chipset: Detects SM Bus Controller and/or PCI Encryption/Decryption Controller devices with vendor ID PCI\VEN_1022*
 - AMD GPU: Detects devices with vendor ID PCI\VEN_1002*
 - Nvidia GPU: Uses original logic from NvidiaInstall.ps1 (PCI\VEN_10DE*)
+- Intel GPU: Detects devices with vendor ID PCI\VEN_8086*
 
 ## 3. Installation Logic
 - If AMD hardware (chipset or GPU) is detected → proceeds with AMD installer (unless both skip flags are set)
 - If Nvidia GPU is detected → proceeds with Nvidia download/install logic (regardless of AMD presence)
-- If neither AMD nor Nvidia hardware is detected (or all installations are skipped) → exits with error "No supported AMD/Nvidia hardware detected or all installations were skipped"
+- If Intel GPU is detected → proceeds with Intel download/install logic (regardless of AMD/NVIDIA presence)
+- If neither AMD nor Nvidia nor Intel hardware is detected (or all installations are skipped) → exits with error "No supported AMD/Nvidia/Intel hardware detected or all installations were skipped"
 
 ## 4. AMD Driver Acquisition
 - Downloads latest AMD chipset driver from TechPowerUp (https://www.techpowerup.com/download/amd-ryzen-chipset-drivers/)
@@ -48,22 +50,39 @@
   * On any failure, logs a red error and reports exit code 2
   * Waits 3 seconds post-install for display stabilization
   * Restores console to green/black before exit prompt
-  * Exits immediately with the Nvidia result code
+  * No longer exits immediately: when Intel hardware is also present, continues to the Intel flow and reports a combined exit code
 
-## 7. Logging & User Experience
+## 7. Intel Installation
+- Runs whenever an Intel GPU is detected, independent of AMD/NVIDIA hardware presence
+- Downloads the latest Intel graphics driver from Intel's official download mirror
+- Extracts the full download URL (downloadmirror.intel.com) from Intel's download page (https://www.intel.com/content/www/us/en/download/785597/intel-arc-graphics-windows.html) and downloads with an appropriate referer header
+- Installs the driver silently using -s --terminateProcesses --report <log> flags
+- Maintains same logging style, user experience, and error handling as other sections
+- Respects -WhatIf parameter appropriately
+- Specific Intel section behavior:
+  * Creates a temporary folder named INTEL_<guid> (GUID suffix avoids collisions) under the folder derived from -LogPath (or $env:temp)
+  * In WhatIf mode, shows the download/install commands without executing
+  * On any failure, logs a red error and reports exit code 2
+  * Waits 3 seconds post-install for display stabilization
+  * Restores console to green/black before exit prompt
+  * Reports a combined exit code with any other installed drivers
+
+## 8. Logging & User Experience
 - Errors: Red text (Write-Host -ForegroundColor Red)
 - Warnings: Yellow text (Write-Host -ForegroundColor Yellow)
 - Success/info: Green text (Write-Host -ForegroundColor Green)
 - On failure: Prompts for keypress before exiting (mirroring Nvidia script)
-- Console color changes match the original script's style for both AMD and Nvidia sections
+- Console color changes match the original script's style for AMD, Nvidia, and Intel sections
 
-## 8. Exit Codes
+## 9. Exit Codes
 - 0 – Success (all requested installations completed successfully)
-- 1 – No supported AMD/Nvidia hardware detected, all installations were skipped, or an unexpected error occurred
-- 2 – Download failure (failed to download a driver from its source; applies to both AMD and Nvidia downloads)
+- 1 – No supported AMD/Nvidia/Intel hardware detected, all installations were skipped, or an unexpected error occurred
+- 2 – Download failure (failed to download a driver from its source; applies to AMD, Nvidia, and Intel downloads)
 - 3 – Installation failure (an installer returned a non-zero exit code)
 
 Notes:
 - AMD installer non-zero exit codes are normalized to 3; AMD download failures are normalized to 2.
 - NVIDIA installer failures report 3; NVIDIA download/info failures report 2.
+- Intel installer failures report 3; Intel download/info failures report 2.
+- When multiple driver installs run (e.g., AMD chipset + NVIDIA GPU, or AMD + Intel), the script installs them all and reports the first failure exit code in install order (chipset → graphics → NVIDIA → Intel).
 - All error paths clean up temporary folders and restore the console colors that were active when the script started.

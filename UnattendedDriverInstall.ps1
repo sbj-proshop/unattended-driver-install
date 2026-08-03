@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
-    Unattended driver installer for AMD and Nvidia hardware.
-
+    Unattended driver installer for AMD, Nvidia and Intel hardware.
+    
 .DESCRIPTION
-    This script detects AMD and Nvidia hardware in the system and installs the appropriate drivers.
+    This script detects AMD, Nvidia and Intel hardware in the system and installs the appropriate drivers.
     For AMD hardware (chipset or GPU), it downloads and installs the latest drivers from TechPowerUp.
     For Nvidia-only systems, it uses the original Nvidia download/install logic.
+    For Intel graphics, it downloads and installs the latest driver from Intel's download mirror.
     The script mirrors the logging style and user experience of the original NvidiaInstall.ps1 script.
 
 .PARAMETER Clean
@@ -32,12 +33,12 @@
     Installs only the AMD graphics driver (if AMD GPU is present).
 
 .NOTES
-    Author: System Integrator
-    Version: 1.1
+    Author: SBJ - Proshop a/s
+    Version: 1.2
 
     Exit codes:
         0 - Success (all requested installations completed successfully)
-        1 - No supported AMD/Nvidia hardware detected, all installations were skipped, or an unexpected error occurred
+        1 - No supported AMD/Nvidia/Intel hardware detected, all installations were skipped, or an unexpected error occurred
         2 - Download failure (failed to download a driver from its source)
         3 - Installation failure (an installer returned a non-zero exit code)
 #>
@@ -284,6 +285,7 @@ function Download-AMDDriverFromTpu {
                 break
             }
             Write-Log -Message "Warning: SHA256 mismatch from $($srv.Name) ($actual) - trying next mirror" -Color 'Yellow'
+            Write-Log -Message "Removing failed download: $installerPath" -Color 'DarkGray'
             Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
         } else {
             Write-Log -Message "Warning: Download failed from $($srv.Name)" -Color 'Yellow'
@@ -463,6 +465,154 @@ function Install-NvidiaDriver {
     return 0
 }
 
+function Get-IntelDriverInfo {
+    Write-Log -Message "Checking for latest Intel graphics driver..." -Color 'Green'
+     
+    $intelPageUrl = "https://www.intel.com/content/www/us/en/download/785597/intel-arc-graphics-windows.html"
+     
+    try {
+        $page = (Invoke-WithRetry -Name "Fetch Intel driver page" -ScriptBlock {
+            Invoke-WebRequest -Uri $intelPageUrl -Method GET -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop -Headers @{ Referer = "https://www.intel.com/"; 'User-Agent' = 'curl/8.18.0'; Accept = '*/*' }
+        })
+         
+        # Extract the full download URL from page (look for .exe download links)
+        $urlMatch = $page.Content -match '(?:href|data-file)["\s]*= ["'']([^"'']*gfx_win[^"'']*\.exe)["'']'
+        if ($urlMatch) {
+            $downloadUrl = $Matches[1]
+            if ($downloadUrl -notmatch '^https?://') {
+                $downloadUrl = 'https://downloadmirror.intel.com/' + $downloadUrl.TrimStart('/')
+            }
+        } else {
+            # Fallback: look for any full .exe URL that points at Intel's download mirror
+            $exeMatches = [regex]::Matches($page.Content, 'https://downloadmirror\.intel\.com/[^"'' ]+\.exe', 'IgnoreCase')
+            if ($exeMatches.Count -gt 0) {
+                $downloadUrl = $exeMatches[0].Value
+            } else {
+                throw 'Could not find Intel driver download URL on download page'
+            }
+        }
+
+        # Extract filename from the URL (e.g., gfx_win_101.8864.exe)
+        $fileName = [System.IO.Path]::GetFileName($downloadUrl)
+         
+        # Extract version from filename if possible (e.g., gfx_win_101.8864.exe -> 101.8864)
+        $version = ''
+        if ($fileName -match '[\._](\d+\.\d+)\.exe$') {
+            $version = $Matches[1]
+        }
+         
+        Write-Log -Message "Latest Intel driver: $fileName (version: $version)" -Color 'Green'
+        return @{ FileName = $fileName; Version = $version; DownloadUrl = $downloadUrl }
+    } catch {
+        Write-Log -Message "Failed to get Intel driver information: $($_.Exception.Message)" -Color 'Red'
+        throw
+    }
+}
+
+function Download-IntelDriver {
+    param(
+        [Parameter(Mandatory)][string]$DownloadUrl,
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$DestinationFolder,
+        [switch]$WhatIf
+    )
+    
+    $destPath = Join-Path $DestinationFolder $FileName
+    
+    Write-Log -Message "Downloading Intel driver $FileName to $destPath" -Color 'Green'
+    
+    if ($WhatIf) {
+        Write-Log -Message "WhatIf: Would download Intel driver from $DownloadUrl to $destPath" -Color 'Yellow'
+        return $destPath
+    }
+    
+    try {
+        # Ensure destination folder exists
+        if (-not (Test-Path -LiteralPath $DestinationFolder)) {
+            New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null
+        }
+        
+        # Download with referer header
+        & curl.exe -L -sS -f --connect-timeout 30 --max-time 3600 `
+            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' `
+            -e 'http://www.intel.com/' `
+            -o $destPath $DownloadUrl 2>$null
+        
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $destPath)) {
+            throw 'Download failed'
+        }
+        
+        Write-Log -Message "Intel driver download finished." -Color 'Green'
+        return $destPath
+    } catch {
+        Write-Log -Message "Intel driver download failed: $($_.Exception.Message)" -Color 'Red'
+        throw
+    }
+}
+
+function Install-IntelDriver {
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [switch]$WhatIf
+    )
+     
+    # Build install arguments with critical switches for unattended installation
+    $driverDir = Split-Path -Path $InstallerPath -Parent
+    $logPath = Join-Path $driverDir "IntelGFX.log"
+    $installArgs = @("-s", "--terminateProcesses", "--report", $logPath)
+    
+    # Optionally add --noExtras to avoid potential conflicts with additional components
+    # $installArgs += "--noExtras"
+    
+    Write-Log -Message "Installing Intel driver with arguments: $installArgs" -Color 'Green'
+     
+    if ($WhatIf) {
+        Write-Log -Message "WhatIf: Would execute Start-Process -FilePath '$InstallerPath' -ArgumentList $installArgs -Wait -PassThru" -Color 'Yellow'
+        return 0
+    }
+     
+    try {
+        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $installArgs -Wait -PassThru
+        $rawCode = $proc.ExitCode
+        $code = $rawCode
+        if ($code -ge 1000) { $code -= 1000 }
+
+        if ($code -eq 0) {
+            Write-Log -Message "Intel installation completed successfully." -Color 'Green'
+            return 0
+        }
+
+        # Reboot/shutdown-required codes are successful installs per Intel's readme
+        if ($code -in 2, 14, 17, 18) {
+            Write-Log -Message "Intel installer exited with code $rawCode (documented code $code). Installation succeeded but a reboot is required." -Color 'Yellow'
+            return 0
+        }
+
+        Write-Log -Message "Intel installer exited with code $rawCode (documented code $code)." -Color 'Yellow'
+
+        # Provide specific guidance based on Intel's documented exit codes
+        switch ($code) {
+            1  { Write-Log -Message "Generic error. Refer to the installation log file for details." -Color 'Red' }
+            5  { Write-Log -Message "Platform not supported. Check Windows version compatibility." -Color 'Red' }
+            6  { Write-Log -Message "Installer was closed by the user before the installation could complete." -Color 'Red' }
+            7  { Write-Log -Message "Invalid command. Check the command-line arguments." -Color 'Red' }
+            8  { Write-Log -Message "Driver file not found. The installer could not find a suitable driver." -Color 'Red' }
+            9  { Write-Log -Message "Driver digital signature missing." -Color 'Red' }
+            10 { Write-Log -Message "Extras digital signature missing." -Color 'Red' }
+            11 { Write-Log -Message "Insufficient disk space. Clean temporary files or specify different temp location." -Color 'Red' }
+            13 { Write-Log -Message "Reboot required before installation can continue." -Color 'Red' }
+            15 { Write-Log -Message "Close required processes before installation. Consider using --terminateProcesses switch." -Color 'Red' }
+            16 { Write-Log -Message "Another installation in progress. Wait for other installations to complete." -Color 'Red' }
+            default { Write-Log -Message "Refer to Intel installation_readme.txt for exit code $code details." -Color 'Red' }
+        }
+
+        return 3
+    } catch {
+        Write-Log -Message "Intel driver installation failed: $($_.Exception.Message)" -Color 'Red'
+        return 3
+    }
+}
+
 try {
     # Hardware Detection
     Write-Log -Message "Detecting hardware..." -Color 'Green'
@@ -484,17 +634,24 @@ try {
     $nvidiaGpu = Get-CimInstance -Class CIM_VideoController | Where-Object { $_.PNPDeviceID -like "PCI\VEN_10DE*" } | Select-Object -First 1
     $hasNvidiaGpu = ($null -ne $nvidiaGpu)
 
+    # Intel GPU detection
+    $intelGpu = Get-CimInstance -Class CIM_VideoController | Where-Object { $_.PNPDeviceID -like "PCI\VEN_8086*" } | Select-Object -First 1
+    $hasIntelGpu = ($null -ne $intelGpu)
+
     Write-Log -Message "AMD Chipset detected: $hasAmdChipset" -Color 'Green'
     Write-Log -Message "AMD GPU detected: $hasAmdGpu" -Color 'Green'
     Write-Log -Message "Nvidia GPU detected: $hasNvidiaGpu" -Color 'Green'
+    Write-Log -Message "Intel GPU detected: $hasIntelGpu" -Color 'Green'
 
     # Determine What to Install
     $installChipset = $hasAmdChipset -and -not $SkipChipset
     $installGraphics = $hasAmdGpu -and -not $SkipGraphics
     $installNvidia = $hasNvidiaGpu
+    $installIntel = $hasIntelGpu
 
     $amdExitCodes = @()
     $nvidiaExitCode = 0
+    $intelExitCode = 0
 
     # Install AMD chipset first (if needed and not skipped)
     if ($installChipset) {
@@ -510,6 +667,7 @@ try {
             $amdExitCodes += 2
         } finally {
             if (-not $WhatIf) {
+                Write-Log -Message "Cleaning up temporary folder: $tempFolder" -Color 'DarkGray'
                 Remove-Item -LiteralPath $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -529,6 +687,7 @@ try {
             $amdExitCodes += 2
         } finally {
             if (-not $WhatIf) {
+                Write-Log -Message "Cleaning up temporary folder: $tempFolder" -Color 'DarkGray'
                 Remove-Item -LiteralPath $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
@@ -554,46 +713,75 @@ try {
 
             $dlFile = Download-NvidiaDriver -DownloadUrl $info.DownloadUrl -Version $info.Version -DestinationFolder $nvidiaTempFolder -WhatIf:$WhatIf
             $nvidiaExitCode = Install-NvidiaDriver -InstallerPath $dlFile -Clean:$Clean -WhatIf:$WhatIf
-
-            Write-Log -Message "Deleting downloaded files" -Color 'Green'
-            Remove-Item -LiteralPath $nvidiaTempFolder -Recurse -Force -ErrorAction SilentlyContinue
         } catch {
             Write-Log -Message "Nvidia driver installation failed: $($_.Exception.Message)" -Color 'Red'
             $nvidiaExitCode = 2
+        } finally {
+            if (-not $WhatIf) {
+                Write-Log -Message "Cleaning up temporary folder: $nvidiaTempFolder" -Color 'DarkGray'
+                Remove-Item -LiteralPath $nvidiaTempFolder -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
-
-        # Sleep to wait for display to blip after driver install and let the powershell window settle
-        Start-Sleep -Seconds 3
-
-        $Host.UI.RawUI.BackgroundColor = 'Green'
-        Write-Host -ForegroundColor Black -BackgroundColor Green "Driver installed. Press any button to exit."
-        $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
-
-        exit $nvidiaExitCode
     }
 
-    # Determine overall AMD exit code: if any non-zero, use first non-zero; else 0
-    $overallAmdExit = 0
-    foreach ($code in $amdExitCodes) {
+    # Install Intel drivers if Intel GPU is present (regardless of AMD/NVIDIA)
+    if ($installIntel) {
+        Write-Log -Message "Intel hardware detected. Proceeding with Intel driver installation." -Color 'Green'
+
+        try {
+            $info = Get-IntelDriverInfo
+
+            # Temporary folder handling
+            $folder = if ($LogPath -and (Split-Path -Path $LogPath -Parent)) { Split-Path -Path $LogPath -Parent } else { "$env:temp" }
+            $intelTempFolder = "$folder\INTEL_$([System.Guid]::NewGuid().ToString('N'))"
+            Register-TempFolder $intelTempFolder
+            New-Item -Path $intelTempFolder -ItemType Directory -Force | Out-Null
+
+            $dlFile = Download-IntelDriver -DownloadUrl $info.DownloadUrl -FileName $info.FileName -DestinationFolder $intelTempFolder -WhatIf:$WhatIf
+            $intelExitCode = Install-IntelDriver -InstallerPath $dlFile -WhatIf:$WhatIf
+        } catch {
+            Write-Log -Message "Intel driver installation failed: $($_.Exception.Message)" -Color 'Red'
+            $intelExitCode = 2
+        } finally {
+            if ($intelTempFolder) {
+                $intelLog = Join-Path $intelTempFolder "IntelGFX.log"
+                if (Test-Path -LiteralPath $intelLog) {
+                    $logDest = Split-Path -Path $intelTempFolder -Parent
+                    Copy-Item -LiteralPath $intelLog -Destination $logDest -Force
+                    Write-Log -Message "Intel installation log saved to $(Join-Path $logDest 'IntelGFX.log')" -Color 'DarkGray'
+                }
+                if (-not $WhatIf) {
+                    Write-Log -Message "Cleaning up temporary folder: $intelTempFolder" -Color 'DarkGray'
+                    Remove-Item -LiteralPath $intelTempFolder -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+
+    # Determine overall exit code: first non-zero across all installed drivers (chipset → graphics → NVIDIA → Intel)
+    $allExitCodes = @($amdExitCodes) + @($nvidiaExitCode) + @($intelExitCode)
+    $overallExitCode = 0
+    foreach ($code in $allExitCodes) {
         if ($code -ne 0) {
-            $overallAmdExit = $code
+            $overallExitCode = $code
             break
         }
     }
 
-    # If we installed AMD drivers, wait and exit with AMD exit code
-    if ($installChipset -or $installGraphics) {
+    # If any drivers were installed, wait and exit with the combined exit code
+    if ($installChipset -or $installGraphics -or $installNvidia -or $installIntel) {
         # Post-install wait and cleanup (mirroring Nvidia script)
         Start-Sleep -Seconds 3
         $Host.UI.RawUI.BackgroundColor = 'Green'
         Write-Host -ForegroundColor Black -BackgroundColor Green "Driver installed. Press any button to exit."
         $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
-        exit $overallAmdExit
+
+        exit $overallExitCode
     }
 
     # If we got here and nothing was installed, error out
-    if (-not $installChipset -and -not $installGraphics -and -not $installNvidia) {
-        Exit-WithError -Message "No supported AMD/Nvidia hardware detected or all installations were skipped." -ExitCode 1
+    if (-not $installChipset -and -not $installGraphics -and -not $installNvidia -and -not $installIntel) {
+        Exit-WithError -Message "No supported AMD/Nvidia/Intel hardware detected or all installations were skipped." -ExitCode 1
     }
 } catch {
     Exit-WithError -Message "Unexpected error: $($_.Exception.Message)" -ExitCode 1
