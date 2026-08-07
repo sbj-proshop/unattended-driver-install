@@ -303,7 +303,7 @@ function Install-AMDDriver {
         [string]$InstallerPath,
         [switch]$WhatIf
     )
-    $installArgs = @("/install")
+    $installArgs = @("-install")
     Write-Log -Message "Installing AMD driver with arguments: $installArgs" -Color 'Green'
     if ($WhatIf) {
         Write-Log -Message "WhatIf: Would execute Start-Process -FilePath '$InstallerPath' -ArgumentList $installArgs -Wait -PassThru" -Color 'Yellow'
@@ -311,6 +311,10 @@ function Install-AMDDriver {
     }
     $proc = Start-Process -FilePath $InstallerPath -ArgumentList $installArgs -Wait -PassThru
     if ($proc.ExitCode -ne 0) {
+        if ($proc.ExitCode -in 2, 3010) {
+            Write-Log -Message "AMD installer exited with code $($proc.ExitCode). Installation succeeded but a reboot is required." -Color 'Yellow'
+            return 0
+        }
         Write-Log -Message "AMD installer exited with code $($proc.ExitCode). The installation may not have completed successfully." -Color 'Yellow'
         return 3
     }
