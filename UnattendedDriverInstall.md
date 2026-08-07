@@ -22,16 +22,16 @@
 - Downloads latest AMD chipset driver from TechPowerUp (https://www.techpowerup.com/download/amd-ryzen-chipset-drivers/)
 - Downloads latest AMD graphics driver from TechPowerUp (https://www.techpowerup.com/download/amd-radeon-graphics-drivers/)
 - Uses TechPowerUp's token-based mirror download flow with SHA-256 verification
-- In WhatIf mode, shows the URL and mirror selection that would be used without executing
+- In WhatIf mode, shows generic download messages without executing
 - Creates separate temporary folders: $env:TEMP\AMDChipsetInstall_<guid> and $env:TEMP\AMDGraphicsInstall_<guid> (GUID suffix avoids collisions between concurrent runs)
 - Temporary folders are registered for cleanup on every exit path (success and failure)
 
 ## 5. AMD Installation Process
 - Downloads each installer to its respective temporary folder
-- Executes with the silent switch: /install
-- In WhatIf mode, shows what would be executed without running
-- Post-install: waits 3 seconds, resets console colors to green/black, prompts for keypress
+- Executes with the silent switch: /install (Chipset) or -install (Graphics)
+- In WhatIf mode, shows generic messages without executing (e.g., "Would download AMD driver from TechPowerUp (mirror selection)")
 - Cleans up temporary folders on success or failure
+- Exit code handling: AMD exit codes 2 and 3010 (reboot required) are treated as success (return 0); other non-zero exit codes return 3 (installation failure)
 - Exit code propagation: returns the first failure exit code (2 for download failure, 3 for installation failure) if any AMD installation fails
 
 ## 6. Nvidia Installation
@@ -46,9 +46,8 @@
   * Resets console to dark blue/white background
   * Clears host display
   * Creates a temporary folder named NVIDIA_<guid> (GUID suffix avoids collisions) under the folder derived from -LogPath (or $env:temp)
-  * In WhatIf mode, shows the download/install commands without executing
+  * In WhatIf mode, shows generic messages without executing (e.g., "Would download Nvidia driver from X to Y")
   * On any failure, logs a red error and reports exit code 2
-  * Waits 3 seconds post-install for display stabilization
   * Restores console to green/black before exit prompt
   * No longer exits immediately: when Intel hardware is also present, continues to the Intel flow and reports a combined exit code
 
@@ -61,9 +60,9 @@
 - Respects -WhatIf parameter appropriately
 - Specific Intel section behavior:
   * Creates a temporary folder named INTEL_<guid> (GUID suffix avoids collisions) under the folder derived from -LogPath (or $env:temp)
-  * In WhatIf mode, shows the download/install commands without executing
+  * In WhatIf mode, shows generic messages without executing (e.g., "Would download Intel driver from X to Y")
   * On any failure, logs a red error and reports exit code 2
-  * Waits 3 seconds post-install for display stabilization
+  * Saves IntelGFX.log to the parent directory of the temp folder before cleanup
   * Restores console to green/black before exit prompt
   * Reports a combined exit code with any other installed drivers
 
@@ -81,7 +80,7 @@
 - 3 – Installation failure (an installer returned a non-zero exit code)
 
 Notes:
-- AMD installer non-zero exit codes are normalized to 3; AMD download failures are normalized to 2.
+- AMD installer exit codes 2 and 3010 (reboot required) are treated as success; other non-zero codes are normalized to 3. AMD download failures are normalized to 2.
 - NVIDIA installer failures report 3; NVIDIA download/info failures report 2.
 - Intel installer failures report 3; Intel download/info failures report 2.
 - When multiple driver installs run (e.g., AMD chipset + NVIDIA GPU, or AMD + Intel), the script installs them all and reports the first failure exit code in install order (chipset → graphics → NVIDIA → Intel).
