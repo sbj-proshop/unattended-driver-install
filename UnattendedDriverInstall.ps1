@@ -301,10 +301,12 @@ function Download-AMDDriverFromTpu {
 function Install-AMDDriver {
     param(
         [string]$InstallerPath,
+        [ValidateSet('Chipset', 'Graphics')]
+        [string]$DriverType = 'Chipset',
         [switch]$WhatIf
     )
-    $installArgs = @("-install")
-    Write-Log -Message "Installing AMD driver with arguments: $installArgs" -Color 'Green'
+    $installArgs = if ($DriverType -eq 'Chipset') { @('/install') } else { @('-install') }
+    Write-Log -Message "Installing AMD $DriverType driver with arguments: $installArgs" -Color 'Green'
     if ($WhatIf) {
         Write-Log -Message "WhatIf: Would execute Start-Process -FilePath '$InstallerPath' -ArgumentList $installArgs -Wait -PassThru" -Color 'Yellow'
         return 0
@@ -664,7 +666,7 @@ try {
         Register-TempFolder $tempFolder
         try {
             $installerPath = Download-AMDDriverFromTpu -PageUrl 'https://www.techpowerup.com/download/amd-ryzen-chipset-drivers/' -DestinationFolder $tempFolder -WhatIf:$WhatIf
-            $exitCode = Install-AMDDriver -InstallerPath $installerPath -WhatIf:$WhatIf
+            $exitCode = Install-AMDDriver -InstallerPath $installerPath -DriverType Chipset -WhatIf:$WhatIf
             $amdExitCodes += $exitCode
         } catch {
             Write-Log -Message "AMD chipset driver installation failed: $($_.Exception.Message)" -Color 'Red'
@@ -684,8 +686,9 @@ try {
         Register-TempFolder $tempFolder
         try {
             $installerPath = Download-AMDDriverFromTpu -PageUrl 'https://www.techpowerup.com/download/amd-radeon-graphics-drivers/' -DestinationFolder $tempFolder -WhatIf:$WhatIf
-            $exitCode = Install-AMDDriver -InstallerPath $installerPath -WhatIf:$WhatIf
+            $exitCode = Install-AMDDriver -InstallerPath $installerPath -DriverType Graphics -WhatIf:$WhatIf
             $amdExitCodes += $exitCode
+            Start-Sleep -Seconds 5
         } catch {
             Write-Log -Message "AMD graphics driver installation failed: $($_.Exception.Message)" -Color 'Red'
             $amdExitCodes += 2
@@ -717,6 +720,7 @@ try {
 
             $dlFile = Download-NvidiaDriver -DownloadUrl $info.DownloadUrl -Version $info.Version -DestinationFolder $nvidiaTempFolder -WhatIf:$WhatIf
             $nvidiaExitCode = Install-NvidiaDriver -InstallerPath $dlFile -Clean:$Clean -WhatIf:$WhatIf
+            Start-Sleep -Seconds 5
         } catch {
             Write-Log -Message "Nvidia driver installation failed: $($_.Exception.Message)" -Color 'Red'
             $nvidiaExitCode = 2
@@ -743,6 +747,7 @@ try {
 
             $dlFile = Download-IntelDriver -DownloadUrl $info.DownloadUrl -FileName $info.FileName -DestinationFolder $intelTempFolder -WhatIf:$WhatIf
             $intelExitCode = Install-IntelDriver -InstallerPath $dlFile -WhatIf:$WhatIf
+            Start-Sleep -Seconds 5
         } catch {
             Write-Log -Message "Intel driver installation failed: $($_.Exception.Message)" -Color 'Red'
             $intelExitCode = 2
