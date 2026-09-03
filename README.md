@@ -126,6 +126,7 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
   - RTX 30 Series
   - RTX 20 Series
   - GTX 16 Series
+  - GTX 10 Series
 - All NVIDIA GPUs (PCI\VEN_10DE*) are supported
 - Both `UnattendedDriverInstall.ps1` and `NvidiaInstall.ps1` falls back to treating unknown NVIDIA GPUs as RTX 40 Series.
 

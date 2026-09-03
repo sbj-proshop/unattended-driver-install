@@ -364,6 +364,7 @@ function Get-NvidiaDriverInfo {
             { $id -ge 0x2200 -and $id -le 0x25FF } { "NVIDIA GeForce RTX 30 Series" }
             { $id -ge 0x1E00 -and $id -le 0x1F7F -and $id -ne 0x1F0A } { "NVIDIA GeForce RTX 20 Series" }
             { $id -eq 0x1F0A -or ($id -ge 0x1F80 -and $id -le 0x21FF) } { "NVIDIA GeForce GTX 16 Series" }
+            { $id -ge 0x1000 -and $id -le 0x17FF } { "NVIDIA GeForce GTX 10 Series" }
         }
     }
 
@@ -380,6 +381,7 @@ function Get-NvidiaDriverInfo {
             { $id -ge 0x2200 -and $id -le 0x25FF } { 120 }
             { $id -ge 0x1E00 -and $id -le 0x1F7F -and $id -ne 0x1F0A } { 107 }
             { $id -eq 0x1F0A -or ($id -ge 0x1F80 -and $id -le 0x21FF) } { 112 }
+            { $id -ge 0x1000 -and $id -le 0x17FF } { 104 }
         }
     }
 
@@ -390,6 +392,7 @@ function Get-NvidiaDriverInfo {
             '*RTX 30*'  { 120 }
             '*RTX 20*'  { 107 }
             '*GTX 16*'  { 112 }
+            '*GTX 10*'  { 104 }
             default     { 127 }
         }
     }
