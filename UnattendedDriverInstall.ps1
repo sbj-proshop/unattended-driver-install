@@ -707,11 +707,6 @@ try {
     if ($installNvidia) {
         Write-Log -Message "Nvidia hardware detected. Proceeding with Nvidia driver installation." -Color 'Green'
 
-        # Reset console colors for Nvidia section (as in original)
-        $Host.UI.RawUI.BackgroundColor = 'DarkBlue'
-        $Host.UI.RawUI.ForegroundColor = 'White'
-        Clear-Host
-
         try {
             $info = Get-NvidiaDriverInfo -GPU $nvidiaGpu
 
