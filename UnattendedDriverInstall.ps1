@@ -4,7 +4,7 @@
     
 .DESCRIPTION
     This script detects AMD, Nvidia and Intel hardware in the system and installs the appropriate drivers.
-    For AMD hardware (chipset or GPU), it downloads and installs the latest drivers from TechPowerUp.
+    For AMD hardware (chipset or GPU), it downloads and installs the latest drivers from AMD directly.
     For Nvidia-only systems, it uses the original Nvidia download/install logic.
     For Intel graphics, it downloads and installs the latest driver from Intel's download mirror.
     The script mirrors the logging style and user experience of the original NvidiaInstall.ps1 script.
@@ -34,7 +34,7 @@
 
 .NOTES
     Author: SBJ - Proshop a/s
-    Version: 1.2
+    Version: 1.3
 
     Exit codes:
         0 - Success (all requested installations completed successfully)
@@ -136,164 +136,139 @@ function Invoke-WithRetry {
     }
 }
 
-# TechPowerUp helper functions (from download-tpu.ps1 and download-tpu-radeon.ps1)
-function Invoke-TpuWeb {
+# Fetch a page body with curl.exe. Supply Referer for hosts that reject direct links.
+# Returns the response body as an array of lines.
+function Invoke-CurlWeb {
     param(
         [string]$Url,
-        [string]$Method = 'GET',
-        [string]$Data = ''
+        [string]$Referer = ''
     )
     if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
         throw 'curl.exe was not found. It ships with Windows 10/11 and PowerShell 7.'
     }
     $ProgressPreference = 'SilentlyContinue'
-    $jar = Join-Path ([System.IO.Path]::GetTempPath()) ("tpu_cookies_" + [System.Guid]::NewGuid().ToString('N') + ".txt")
-    try {
-        $curlArgs = @('-sS', '--connect-timeout', '30', '--max-time', '120',
-            '-b', $jar, '-c', $jar, '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
-        if ($Method -eq 'POST') {
-            $curlArgs += @('-X', 'POST', '--data', $Data)
-        }
-        $curlArgs += $Url
-        & curl.exe @curlArgs
-    } finally {
-        Remove-Item -LiteralPath $jar -Force -ErrorAction SilentlyContinue
+    $curlArgs = @('-sS', '--connect-timeout', '30', '--max-time', '120',
+        '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+    if ($Referer) {
+        $curlArgs += @('-e', $Referer)
     }
+    $curlArgs += $Url
+    & curl.exe @curlArgs
 }
 
-function Get-TpuRedirect {
+# Download a file with curl.exe. Supply Referer for hosts that reject direct links.
+# Returns $true when curl succeeded and the file exists.
+function Invoke-CurlDownload {
     param(
         [string]$Url,
-        [string]$Data
+        [string]$Dest,
+        [string]$Referer = ''
     )
     if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
         throw 'curl.exe was not found. It ships with Windows 10/11 and PowerShell 7.'
     }
     $ProgressPreference = 'SilentlyContinue'
-    $jar = Join-Path ([System.IO.Path]::GetTempPath()) ("tpu_cookies_" + [System.Guid]::NewGuid().ToString('N') + ".txt")
-    try {
-        $headers = & curl.exe -sS -D - -o NUL --connect-timeout 30 --max-time 60 `
-            -b $jar -c $jar -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -X POST --data $Data $Url 2>$null
-        foreach ($line in $headers) {
-            if ($line -match '^location:\s*(\S+)\s*$') {
-                $loc = $Matches[1]
-                if ($loc -notmatch '^https?://') { $loc = 'https://www.techpowerup.com' + $loc }
-                return $loc
-            }
-        }
-        return $null
-    } finally {
-        Remove-Item -LiteralPath $jar -Force -ErrorAction SilentlyContinue
+    $curlArgs = @('-L', '-sS', '-f', '--connect-timeout', '30', '--max-time', '7200',
+        '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+    if ($Referer) {
+        $curlArgs += @('-e', $Referer)
     }
+    $curlArgs += @('-o', $Dest, $Url)
+    & curl.exe @curlArgs 2>$null
+    return ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Dest))
 }
 
-function Invoke-TpuDownload {
+# AMD's driver page, which names the current Adrenalin release and is also the Referer
+# that drivers.amd.com demands on every download.
+$script:AmdDriverPageUrl = 'https://www.amd.com/en/support/download/drivers.html'
+$script:AmdChipsetVersionUrl = 'https://drivers.amd.com/drivers/installer/chipset/version.txt'
+$script:AmdChipsetInstallerUrl = 'https://drivers.amd.com/drivers/installer/chipset/AMD_Chipset_Software.exe'
+
+# Read the current Adrenalin release from the AMD driver page and build the download URL
+# for the full package. Returns a hashtable with Url, FileName and Version.
+#
+# Why "-c": AMD splits the Adrenalin package by driver branch. The "-a" branch carries the
+# Ryzen desktop integrated GPUs (Raphael 164E, Granite Ridge 13C0) and RDNA2; the "-b" branch
+# carries RDNA3/RDNA4 and the Phoenix APUs. A machine with a Ryzen desktop CPU and a current
+# Radeon card spans both, and only "-c" ships both branches. Picking "-a" or "-b" leaves one
+# of the two devices on the Microsoft Basic Display Adapter.
+function Get-AMDGraphicsDriverInfo {
+    Write-Log -Message "Checking for latest AMD graphics driver..." -Color 'Green'
+    $page = (Invoke-WithRetry -Name 'Fetch AMD driver page' -ScriptBlock { Invoke-CurlWeb $script:AmdDriverPageUrl }) -join "`n"
+    if (-not $page) { throw "Failed to fetch $script:AmdDriverPageUrl" }
+
+    $versionMatch = [regex]::Match($page, 'adrenalin-edition-(\d+(?:\.\d+)+)-minimalsetup', 'IgnoreCase')
+    if (-not $versionMatch.Success) {
+        throw 'Could not read the Adrenalin release from the AMD driver page. The page layout may have changed.'
+    }
+
+    $version = $versionMatch.Groups[1].Value
+    $fileName = "whql-amd-software-adrenalin-edition-$version-win11-c.exe"
+    Write-Log -Message "Latest: AMD Software Adrenalin Edition $version ($fileName)" -Color 'Green'
+    return @{ Url = "https://drivers.amd.com/drivers/$fileName"; FileName = $fileName; Version = $version }
+}
+
+# Read the current chipset driver version from AMD's plain-text version file.
+# Returns a hashtable with Url, FileName and Version.
+function Get-AMDChipsetDriverInfo {
+    Write-Log -Message "Checking for latest AMD chipset driver..." -Color 'Green'
+    $version = ((Invoke-WithRetry -Name 'Fetch AMD chipset version' -ScriptBlock { Invoke-CurlWeb $script:AmdChipsetVersionUrl -Referer $script:AmdDriverPageUrl }) -join '').Trim()
+    if ($version -notmatch '^\d+(\.\d+)+$') {
+        throw "AMD chipset version file returned an unexpected value: '$version'"
+    }
+
+    $fileName = "AMD_Chipset_Software_$version.exe"
+    Write-Log -Message "Latest: AMD Chipset Software $version" -Color 'Green'
+    return @{ Url = $script:AmdChipsetInstallerUrl; FileName = $fileName; Version = $version }
+}
+
+# AMD publishes no checksum alongside these downloads, so the Authenticode signature is the
+# integrity gate. Throws when the file is not validly signed by AMD.
+function Assert-AMDInstallerSignature {
     param(
-        [string]$Url,
-        [string]$Dest
+        [Parameter(Mandatory)][string]$InstallerPath
     )
-    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
-        throw 'curl.exe was not found. It ships with Windows 10/11 and PowerShell 7.'
+    $signature = Get-AuthenticodeSignature -LiteralPath $InstallerPath
+    if ($signature.Status -ne 'Valid') {
+        throw "Downloaded AMD installer failed Authenticode validation (status: $($signature.Status))."
     }
-    $ProgressPreference = 'SilentlyContinue'
-    $jar = Join-Path ([System.IO.Path]::GetTempPath()) ("tpu_cookies_" + [System.Guid]::NewGuid().ToString('N') + ".txt")
-    try {
-        & curl.exe -L -sS -f --connect-timeout 30 --max-time 3600 -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -o $Dest $Url 2>$null
-        return ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Dest))
-    } finally {
-        Remove-Item -LiteralPath $jar -Force -ErrorAction SilentlyContinue
+    if ($signature.SignerCertificate.Subject -notmatch 'Advanced Micro Devices') {
+        throw "Downloaded AMD installer is signed by an unexpected publisher: $($signature.SignerCertificate.Subject)"
     }
+    Write-Log -Message "Signature verified: $($signature.SignerCertificate.Subject)" -Color 'Green'
 }
 
-function Get-AMDDriverInfoFromTpu {
+# Download an AMD installer and verify its signature. Returns the path it was saved to.
+# Why the Referer: drivers.amd.com answers direct links with a 302 to its
+# "Download Incomplete" page unless the AMD driver page is sent as the Referer.
+function Download-AMDDriver {
     param(
-        [string]$PageUrl
-    )
-    Write-Log -Message "Fetching $PageUrl ..." -Color 'Green'
-    $page = (Invoke-WithRetry -Name "Fetch $PageUrl" -ScriptBlock { Invoke-TpuWeb $PageUrl }) -join "`n"
-    if (-not $page) { throw "Failed to fetch $PageUrl" }
-
-    $idMatch    = [regex]::Match($page, 'name="id" value="(\d+)"')
-    $titleMatch = [regex]::Match($page, '<h3 class="title">\s*(.*?)\s*</h3>', 'Singleline')
-    $fileMatch  = [regex]::Match($page, '<div class="filename" title="File Name">(.*?)</div>', 'Singleline')
-    $shaMatch   = [regex]::Match($page, 'hash-name">SHA256:</div>\s*<div class="hash-value">([0-9A-Fa-f]{64})</div>', 'Singleline')
-
-    if (-not $idMatch.Success) { throw 'Could not find a version "id" on the page.' }
-
-    $id       = $idMatch.Groups[1].Value
-    $version  = if ($titleMatch.Success) { $titleMatch.Groups[1].Value.Trim() } else { "id $id" }
-    $fileName = if ($fileMatch.Success)  { $fileMatch.Groups[1].Value.Trim() } else { "techpowerup-$id.exe" }
-    $sha256   = if ($shaMatch.Success)   { $shaMatch.Groups[1].Value.ToUpperInvariant() } else { '' }
-
-    Write-Log -Message "Latest: $version (id=$id)" -Color 'Green'
-    if ($sha256) { Write-Log -Message "Expected SHA256: $sha256" -Color 'Green' }
-
-    return @{ Id = $id; Version = $version; FileName = $fileName; SHA256 = $sha256 }
-}
-
-function Download-AMDDriverFromTpu {
-    param(
-        [string]$PageUrl,
-        [string]$DestinationFolder,
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$DestinationFolder,
         [switch]$WhatIf
     )
-    $info = Get-AMDDriverInfoFromTpu -PageUrl $PageUrl
-    $id = $info.Id
-    $fileName = $info.FileName
-    $sha256 = $info.SHA256
-
-    Write-Log -Message "Fetching mirror list ..." -Color 'Green'
-    $mirrors = (Invoke-WithRetry -Name 'TechPowerUp mirror list' -ScriptBlock { Invoke-TpuWeb $PageUrl -Method POST -Data "id=$id" }) -join "`n"
-    $buttons = [regex]::Matches($mirrors, '<button type="submit" name="server_id" value="(\d+)"[^>]*>(.*?)</button>', 'Singleline')
-    if ($buttons.Count -eq 0) { throw 'Could not find any mirror servers.' }
-
-    $servers = foreach ($b in $buttons) {
-        $inner = $b.Groups[2].Value
-        [pscustomobject]@{
-            Id      = [int]$b.Groups[1].Value
-            Name    = ([regex]::Match($inner, 'server-name">(.*?)</span>', 'Singleline')).Groups[1].Value
-            Closest = $inner -match 'class="closest"'
-        }
+    if (-not (Test-Path -LiteralPath $DestinationFolder)) {
+        New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null
     }
-    $servers = @($servers | Sort-Object -Property @{ Expression = 'Closest'; Descending = $true })
-
-    if (-not (Test-Path -LiteralPath $DestinationFolder)) { New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null }
-    $installerPath = Join-Path $DestinationFolder $fileName
+    $installerPath = Join-Path $DestinationFolder $FileName
 
     if ($WhatIf) {
-        Write-Log -Message "WhatIf: Would download AMD driver from TechPowerUp (mirror selection)" -Color 'Yellow'
+        Write-Log -Message "WhatIf: Would download $Url" -Color 'Yellow'
         Write-Log -Message "WhatIf: Would save to $installerPath" -Color 'Yellow'
         return $installerPath
     }
 
-    Write-Log -Message "Downloading AMD driver..." -Color 'Green'
-    $success = $false
-    foreach ($srv in $servers) {
-        $tag = if ($srv.Closest) { ' (closest)' } else { '' }
-        Write-Log -Message "Trying mirror: $($srv.Name)$tag" -Color 'Yellow'
-        $cdl = Get-TpuRedirect $PageUrl ("id=$id&server_id=$($srv.Id)")
-        if (-not $cdl) { Write-Log -Message "Warning: No download link returned from $($srv.Name)" -Color 'Yellow'; continue }
-        Write-Log -Message "  CDN URL: $cdl" -Color 'Green'
-        if (Invoke-TpuDownload $cdl $installerPath) {
-            if (-not $sha256) {
-                $success = $true
-                break
-            }
-            $actual = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash
-            if ($actual -eq $sha256) {
-                $success = $true
-                break
-            }
-            Write-Log -Message "Warning: SHA256 mismatch from $($srv.Name) ($actual) - trying next mirror" -Color 'Yellow'
-            Write-Log -Message "Removing failed download: $installerPath" -Color 'DarkGray'
+    Write-Log -Message "Downloading $FileName ..." -Color 'Green'
+    Invoke-WithRetry -Name "Download $FileName" -ScriptBlock {
+        if (-not (Invoke-CurlDownload $Url $installerPath -Referer $script:AmdDriverPageUrl)) {
             Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
-        } else {
-            Write-Log -Message "Warning: Download failed from $($srv.Name)" -Color 'Yellow'
+            throw "curl.exe could not download $Url"
         }
-    }
-    if (-not $success) {
-        throw 'All mirrors failed. Please retry later.'
-    }
+        $true
+    } | Out-Null
+
+    Assert-AMDInstallerSignature -InstallerPath $installerPath
     Write-Log -Message "Download finished." -Color 'Green'
     return $installerPath
 }
@@ -541,13 +516,7 @@ function Download-IntelDriver {
             New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null
         }
         
-        # Download with referer header
-        & curl.exe -L -sS -f --connect-timeout 30 --max-time 3600 `
-            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' `
-            -e 'http://www.intel.com/' `
-            -o $destPath $DownloadUrl 2>$null
-        
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $destPath)) {
+        if (-not (Invoke-CurlDownload $DownloadUrl $destPath -Referer 'http://www.intel.com/')) {
             throw 'Download failed'
         }
         
@@ -668,7 +637,8 @@ try {
         $tempFolder = "$env:TEMP\AMDChipsetInstall_$([System.Guid]::NewGuid().ToString('N'))"
         Register-TempFolder $tempFolder
         try {
-            $installerPath = Download-AMDDriverFromTpu -PageUrl 'https://www.techpowerup.com/download/amd-ryzen-chipset-drivers/' -DestinationFolder $tempFolder -WhatIf:$WhatIf
+            $info = Get-AMDChipsetDriverInfo
+            $installerPath = Download-AMDDriver -Url $info.Url -FileName $info.FileName -DestinationFolder $tempFolder -WhatIf:$WhatIf
             $exitCode = Install-AMDDriver -InstallerPath $installerPath -DriverType Chipset -WhatIf:$WhatIf
             $amdExitCodes += $exitCode
         } catch {
@@ -688,7 +658,8 @@ try {
         $tempFolder = "$env:TEMP\AMDGraphicsInstall_$([System.Guid]::NewGuid().ToString('N'))"
         Register-TempFolder $tempFolder
         try {
-            $installerPath = Download-AMDDriverFromTpu -PageUrl 'https://www.techpowerup.com/download/amd-radeon-graphics-drivers/' -DestinationFolder $tempFolder -WhatIf:$WhatIf
+            $info = Get-AMDGraphicsDriverInfo
+            $installerPath = Download-AMDDriver -Url $info.Url -FileName $info.FileName -DestinationFolder $tempFolder -WhatIf:$WhatIf
             $exitCode = Install-AMDDriver -InstallerPath $installerPath -DriverType Graphics -WhatIf:$WhatIf
             $amdExitCodes += $exitCode
             Start-Sleep -Seconds 5

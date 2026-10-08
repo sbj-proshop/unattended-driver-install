@@ -18,7 +18,7 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
 
 - **Multi-Vendor Support** — Detects and installs drivers for AMD (chipset and GPU), NVIDIA, and Intel graphics
 - **Smart Detection** — Uses WMI to identify hardware by PCI vendor IDs
-- **AMD Support** — Downloads latest chipset and graphics drivers from TechPowerUp with SHA-256 verification
+- **AMD Support** — Downloads the latest chipset and graphics drivers from AMD directly, verified by Authenticode signature
 - **NVIDIA Support** — Uses the same logic as NvidiaInstall.ps1 to get latest drivers from NVIDIA's AjaxDriverService API
 - **Intel Support** — Downloads latest drivers from Intel's official download mirror
 - **Flexible Installation** — Options to skip specific components (chipset/graphics) for AMD
@@ -100,7 +100,7 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
 
 3. For each driver type:
    - Downloads the latest driver from the appropriate source
-   - Verifies downloads where possible (SHA-256 for AMD)
+   - Verifies downloads where possible (Authenticode signature for AMD)
    - Runs the installer silently with appropriate parameters
    - Cleans up temporary files
    - Tracks exit codes
