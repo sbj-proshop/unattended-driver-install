@@ -19,9 +19,12 @@
 - If neither AMD nor Nvidia nor Intel hardware is detected (or all installations are skipped) → exits with error "No supported AMD/Nvidia/Intel hardware detected or all installations were skipped"
 
 ## 4. AMD Driver Acquisition
-- Downloads latest AMD chipset driver from TechPowerUp (https://www.techpowerup.com/download/amd-ryzen-chipset-drivers/)
-- Downloads latest AMD graphics driver from TechPowerUp (https://www.techpowerup.com/download/amd-radeon-graphics-drivers/)
-- Uses TechPowerUp's token-based mirror download flow with SHA-256 verification
+- Downloads the latest AMD chipset driver from AMD: version from https://drivers.amd.com/drivers/installer/chipset/version.txt, installer from https://drivers.amd.com/drivers/installer/chipset/AMD_Chipset_Software.exe
+- Downloads the latest AMD graphics driver from AMD: reads the Adrenalin version off the minimal-setup filename on https://www.amd.com/en/support/download/drivers.html, then builds https://drivers.amd.com/drivers/whql-amd-software-adrenalin-edition-<version>-win11-c.exe
+  - AMD splits the Adrenalin package by driver branch: the `-a` branch carries the Ryzen desktop integrated GPUs (Raphael `164E`, Granite Ridge `13C0`) and RDNA2, the `-b` branch carries RDNA3/RDNA4 and the Phoenix APUs. A machine with a Ryzen desktop CPU and a current Radeon card spans both branches, so the script always takes the `-c` package, which ships both. TechPowerUp's primary download switched from `-c` to `-b` at 26.9.1, which is why integrated graphics stopped getting a driver.
+  - drivers.amd.com answers direct links with a 302 to its "Download Incomplete" page unless the AMD driver page is sent as the `Referer`; this applies to `version.txt` as well as the installers
+  - AMD publishes no checksum, so the Authenticode signature is the integrity gate: the file must validate as `Valid` and be signed by `Advanced Micro Devices`
+  - The graphics package is roughly 1.7 GB and is downloaded on every run
 - In WhatIf mode, shows generic download messages without executing
 - Creates separate temporary folders: $env:TEMP\AMDChipsetInstall_<guid> and $env:TEMP\AMDGraphicsInstall_<guid> (GUID suffix avoids collisions between concurrent runs)
 - Temporary folders are registered for cleanup on every exit path (success and failure)
@@ -29,7 +32,7 @@
 ## 5. AMD Installation Process
 - Downloads each installer to its respective temporary folder
 - Executes with the silent switch: /install (Chipset) or -install (Graphics)
-- In WhatIf mode, shows generic messages without executing (e.g., "Would download AMD driver from TechPowerUp (mirror selection)")
+- In WhatIf mode, shows generic messages without executing (e.g., "Would download <url>")
 - Cleans up temporary folders on success or failure
 - Exit code handling: AMD exit codes 2 and 3010 (reboot required) are treated as success (return 0); other non-zero exit codes return 3 (installation failure)
 - Exit code propagation: returns the first failure exit code (2 for download failure, 3 for installation failure) if any AMD installation fails

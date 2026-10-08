@@ -31,6 +31,8 @@ Installs AMD, NVIDIA, or Intel drivers based on detected hardware.
 - Scripts wait for user keypress before exiting (press any key)
 - NvidiaInstall.ps1 detects GPU via WMI and queries NVIDIA's AjaxDriverService API
 - UnattendedDriverInstall.ps1 detects AMD chipset (SM Bus Controller) and GPU, Intel GPU, and falls back to NVIDIA logic
-- AMD driver logic downloads latest installer from TechPowerUp (chipset and graphics drivers) and installs silently
+- AMD driver logic downloads both installers from AMD directly (drivers.amd.com requires the AMD driver page as `Referer`), verifies the Authenticode signature, and installs silently
+  - Chipset version comes from `drivers.amd.com/drivers/installer/chipset/version.txt`; the installer is `AMD_Chipset_Software.exe` beside it
+  - Graphics version is read off the minimal-setup filename on `amd.com/en/support/download/drivers.html`, then the full package URL is built as `drivers.amd.com/drivers/whql-amd-software-adrenalin-edition-<version>-win11-c.exe`
 - Intel driver logic downloads latest installer from Intel's download mirror and installs silently with -s --terminateProcesses --report <log> flags
 - No build, test, or CI configuration exists in this repository
