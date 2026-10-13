@@ -23,9 +23,12 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
 - **Intel Support** — Downloads latest drivers from Intel's official download mirror
 - **Flexible Installation** — Options to skip specific components (chipset/graphics) for AMD
 - **Silent Installation** — All installations run silently with appropriate parameters
+- **Shared Driver Cache** — Keeps downloaded installers on the application share, so a rebuild
+  costs a version probe instead of a full download. Falls back to downloading directly whenever
+  the share is unreachable
 - **Auto-cleanup** — Deletes temporary download folders after installation
 - **WhatIf Mode** — Preview actions without executing
-- **Detailed Logging** — Color-coded output for easy tracking
+- **Detailed Logging** — Color-coded output, written to a log file as well as the console
 
 ## Usage
 
@@ -41,7 +44,7 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
 
 ### UnattendedDriverInstall.ps1
 ```powershell
-.\UnattendedDriverInstall.ps1 [-Clean] [-WhatIf] [-SkipChipset] [-SkipGraphics] [-LogPath <path>]
+.\UnattendedDriverInstall.ps1 [-Clean] [-WhatIf] [-SkipChipset] [-SkipGraphics] [-LogPath <path>] [-CacheRoot <path>] [-NoCache]
 ```
 
 | Parameter     | Description                                                                      |
@@ -50,7 +53,9 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
 | `-WhatIf`     | Shows actions without executing                                                  |
 | `-SkipChipset`| Skip AMD chipset driver install                                                  |
 | `-SkipGraphics`| Skip AMD graphics driver install                                                |
-| `-LogPath`    | Custom log file path (folder used for temp files). Only used for Intel installer |
+| `-LogPath`    | Custom log file path (folder also used for temp files)                          |
+| `-CacheRoot`  | Driver cache folder (default: `\\DUTZO_WDS\ApplicationShare\DriverCache`)       |
+| `-NoCache`    | Ignore the cache and download every driver directly from the vendor             |
 
 ## Examples
 
@@ -82,6 +87,12 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
 
 # Specify custom log/temp folder
 .\UnattendedDriverInstall.ps1 -LogPath "D:\Logs"
+
+# Force a fresh download, ignoring the cache
+.\UnattendedDriverInstall.ps1 -NoCache
+
+# Use a different cache location
+.\UnattendedDriverInstall.ps1 -CacheRoot "D:\DriverCache"
 ```
 
 ## How it works (UnattendedDriverInstall.ps1)
@@ -99,9 +110,11 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
    - Installs Intel driver (if Intel GPU detected)
 
 3. For each driver type:
-   - Downloads the latest driver from the appropriate source
-   - Verifies downloads where possible (Authenticode signature for AMD)
-   - Runs the installer silently with appropriate parameters
+   - Asks the vendor which version is current
+   - Takes that version from the cache when it is already there, otherwise downloads it
+     from the vendor and adds it to the cache
+   - Verifies the Authenticode signature, on cached copies as well as fresh downloads
+   - Runs the installer silently from a local temp folder
    - Cleans up temporary files
    - Tracks exit codes
 
@@ -110,6 +123,32 @@ Unattended driver installer for AMD, NVIDIA, and Intel hardware. This script det
    - 1: No supported hardware detected or all installations skipped
    - 2: Download failure
    - 3: Installation failure
+
+## Driver cache
+
+Installers are kept on the application share so that only the first machine to need a given
+version pays for the download:
+
+```
+\\DUTZO_WDS\ApplicationShare\DriverCache\
+  amd-chipset\AMD_Chipset_Software_<version>.exe
+  amd-graphics\whql-amd-software-adrenalin-edition-<version>-win11-c.exe
+  nvidia\<product series id>\<version>.exe
+  intel\gfx_win_<version>.exe
+```
+
+- The file name carries the version, so the directory listing is the whole index. There is no
+  metadata file to fall out of step with the files.
+- NVIDIA packages are kept per product series, so a GTX 10 machine and an RTX 50 machine each
+  keep their own.
+- The current version and one fallback are kept per category; older entries are pruned after a
+  new version is cached.
+- Every installer is Authenticode-verified before it runs, cached copies included. A cached file
+  that fails verification is deleted and downloaded again.
+- If the share is unreachable, or `-NoCache` is given, the script downloads directly from the
+  vendor exactly as before.
+- If the vendor version lookup fails but a cached package exists, the newest cached package is
+  installed instead of failing the run.
 
 ## Supported Hardware
 

@@ -24,6 +24,13 @@
 .PARAMETER LogPath
     Optional custom log file path.
 
+.PARAMETER CacheRoot
+    Folder holding the shared driver package cache. Defaults to the application share.
+    Installers are stored there so a rebuild only costs a version probe, not a full download.
+
+.PARAMETER NoCache
+    Ignore the cache and download every driver directly from the vendor.
+
 .EXAMPLE
     .\UnattendedDriverInstall.ps1 -WhatIf
     Shows what the script would do without executing.
@@ -34,7 +41,7 @@
 
 .NOTES
     Author: SBJ - Proshop a/s
-    Version: 1.3
+    Version: 1.4
 
     Exit codes:
         0 - Success (all requested installations completed successfully)
@@ -48,7 +55,9 @@ param (
     [switch]$WhatIf,         # show actions without executing
     [switch]$SkipChipset,    # do not install chipset driver
     [switch]$SkipGraphics,   # do not install graphics driver
-    [string]$LogPath         # optional custom log file
+    [string]$LogPath,        # optional custom log file
+    [string]$CacheRoot = '\\DUTZO_WDS\ApplicationShare\DriverCache',
+    [switch]$NoCache         # bypass the cache and always download
 )
 
 # Preserve original console colors so they can be restored on every exit path.
@@ -58,6 +67,31 @@ $script:originalForegroundColor = $Host.UI.RawUI.ForegroundColor
 # Temporary folders created during the run; cleaned up on every exit path.
 $script:tempFolders = @()
 
+# Path of the run log. Set by Initialize-LogFile before any other work.
+$script:LogFilePath = $null
+
+# Open the run log. The script is tested on build machines where the console scrolls past
+# and is never captured, so every message also goes to a file.
+function Initialize-LogFile {
+    param (
+        [string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $Path = Join-Path $env:TEMP "UnattendedDriverInstall_$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+    }
+    try {
+        $parent = Split-Path -Path $Path -Parent
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+        }
+        Set-Content -LiteralPath $Path -Value "Unattended driver install started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $env:COMPUTERNAME" -ErrorAction Stop
+        $script:LogFilePath = $Path
+        Write-Host -ForegroundColor DarkGray "Logging to $Path"
+    } catch {
+        Write-Host -ForegroundColor Yellow "Could not open log file ${Path}: $($_.Exception.Message)"
+    }
+}
+
 # Function to write colored messages (mirroring NvidiaInstall.ps1 style)
 function Write-Log {
     param (
@@ -65,6 +99,12 @@ function Write-Log {
         [string]$Color = 'White'
     )
     Write-Host -ForegroundColor $Color $Message
+    if ($script:LogFilePath) {
+        try {
+            Add-Content -LiteralPath $script:LogFilePath -Value "$(Get-Date -Format 'HH:mm:ss')  $Message" -ErrorAction Stop
+        } catch {
+        }
+    }
 }
 
 # Prompt for keypress before exiting (mirroring NvidiaInstall.ps1 style)
@@ -178,6 +218,243 @@ function Invoke-CurlDownload {
     return ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $Dest))
 }
 
+# Publisher fragments expected in the Authenticode subject of each vendor's installer.
+$script:AmdPublisher = 'Advanced Micro Devices'
+$script:NvidiaPublisher = 'NVIDIA'
+$script:IntelPublisher = 'Intel'
+
+# Vendors publish no checksum beside these downloads, so the Authenticode signature is the
+# integrity gate. Cached copies are checked too: a corrupt file on the share carries the
+# right name and the wrong bytes, and would otherwise reach every machine instead of one.
+function Assert-InstallerSignature {
+    param(
+        [Parameter(Mandatory)][string]$InstallerPath,
+        [Parameter(Mandatory)][string]$ExpectedPublisher
+    )
+    $fileName = [System.IO.Path]::GetFileName($InstallerPath)
+    $signature = Get-AuthenticodeSignature -LiteralPath $InstallerPath
+    if ($signature.Status -ne 'Valid') {
+        throw "$fileName failed Authenticode validation (status: $($signature.Status))."
+    }
+    $subject = $signature.SignerCertificate.Subject
+    if ($subject -notmatch [regex]::Escape($ExpectedPublisher)) {
+        throw "$fileName is signed by an unexpected publisher: $subject"
+    }
+    Write-Log -Message "Signature verified: $subject" -Color 'Green'
+}
+
+# --- Driver package cache -------------------------------------------------------------
+# Installers are kept on the application share so a rebuild costs a version probe instead
+# of a full download. The file name carries the version, so the directory listing is the
+# whole index and there is no metadata file to fall out of step with the files.
+
+$script:CacheEnabled = $false
+$script:CacheRootPath = $null
+$script:CacheKeepVersions = 2
+
+# Confirm the cache root is reachable and writable. A cache that cannot be reached must
+# cost bandwidth, never a build, so every failure here falls back to a direct download.
+function Initialize-DriverCache {
+    param(
+        [string]$Root,
+        [switch]$Disabled
+    )
+    if ($Disabled) {
+        Write-Log -Message "CACHE-OFF  Disabled by -NoCache." -Color 'DarkGray'
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($Root)) {
+        Write-Log -Message "CACHE-OFF  No cache root configured." -Color 'DarkGray'
+        return
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $Root)) {
+            New-Item -ItemType Directory -Path $Root -Force -ErrorAction Stop | Out-Null
+        }
+        $probePath = Join-Path $Root ".writetest-$([System.Guid]::NewGuid().ToString('N'))"
+        Set-Content -LiteralPath $probePath -Value 'probe' -ErrorAction Stop
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        $script:CacheRootPath = $Root
+        $script:CacheEnabled = $true
+        Write-Log -Message "CACHE-ON   $Root (read/write)" -Color 'Green'
+    } catch {
+        Write-Log -Message "CACHE-OFF  $Root is unavailable: $($_.Exception.Message)" -Color 'Yellow'
+        Write-Log -Message "Drivers will be downloaded directly from the vendor." -Color 'Yellow'
+    }
+}
+
+# Full path of a cached installer, or $null when it is not cached.
+function Get-CachedDriverPath {
+    param(
+        [Parameter(Mandatory)][string]$Category,
+        [Parameter(Mandatory)][string]$FileName
+    )
+    if (-not $script:CacheEnabled) { return $null }
+    $candidate = Join-Path (Join-Path $script:CacheRootPath $Category) $FileName
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+    return $null
+}
+
+# Full path of the most recently cached installer in a category, or $null when empty.
+function Get-NewestCachedDriverPath {
+    param(
+        [Parameter(Mandatory)][string]$Category
+    )
+    if (-not $script:CacheEnabled) { return $null }
+    $categoryPath = Join-Path $script:CacheRootPath $Category
+    if (-not (Test-Path -LiteralPath $categoryPath)) { return $null }
+    $newest = Get-ChildItem -LiteralPath $categoryPath -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newest) { return $newest.FullName }
+    return $null
+}
+
+# Keep the current version and one fallback.
+# Why ordered by write time: AMD (25.9.1), Nvidia (581.57) and Intel (101.8864) version
+# strings share no format that sorts correctly, and acquisition order is what is wanted.
+# Save-DriverToCache stamps each entry as it lands, so the write time is the time it was
+# cached rather than whatever timestamp the download arrived with.
+function Remove-StaleCacheEntries {
+    param(
+        [Parameter(Mandatory)][string]$Category
+    )
+    if (-not $script:CacheEnabled) { return }
+    $categoryPath = Join-Path $script:CacheRootPath $Category
+    if (-not (Test-Path -LiteralPath $categoryPath)) { return }
+
+    $stale = Get-ChildItem -LiteralPath $categoryPath -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip $script:CacheKeepVersions
+    foreach ($entry in $stale) {
+        try {
+            Remove-Item -LiteralPath $entry.FullName -Force -ErrorAction Stop
+            Write-Log -Message "PRUNE      $($entry.Name)" -Color 'DarkGray'
+        } catch {
+            Write-Log -Message "PRUNE      Skipped $($entry.Name), in use by another machine." -Color 'DarkGray'
+        }
+    }
+
+    $abandoned = Get-ChildItem -LiteralPath $categoryPath -Filter '*.part' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) }
+    foreach ($entry in $abandoned) {
+        Remove-Item -LiteralPath $entry.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Copy a verified installer into the cache.
+# Why the staging name: several workstations image at once and race for the same new
+# version. The copy lands on a per-machine temporary name and is renamed into place, so a
+# half-written file never carries a name that claims to be complete. Losing that race is a
+# normal outcome, not an error.
+function Save-DriverToCache {
+    param(
+        [Parameter(Mandatory)][string]$Category,
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$FileName,
+        [switch]$WhatIf
+    )
+    if ($WhatIf -or -not $script:CacheEnabled) { return }
+    try {
+        $categoryPath = Join-Path $script:CacheRootPath $Category
+        if (-not (Test-Path -LiteralPath $categoryPath)) {
+            New-Item -ItemType Directory -Path $categoryPath -Force -ErrorAction Stop | Out-Null
+        }
+        $finalPath = Join-Path $categoryPath $FileName
+        if (Test-Path -LiteralPath $finalPath) {
+            Write-Log -Message "STORE      $FileName was already cached." -Color 'DarkGray'
+            return
+        }
+
+        $stagingPath = Join-Path $categoryPath "$FileName.$env:COMPUTERNAME-$([System.Guid]::NewGuid().ToString('N')).part"
+        Copy-Item -LiteralPath $SourcePath -Destination $stagingPath -Force -ErrorAction Stop
+        try {
+            Move-Item -LiteralPath $stagingPath -Destination $finalPath -ErrorAction Stop
+
+            # Why the file is restamped: pruning keeps the newest entries by write time, and
+            # a copied file inherits the source timestamp. Start-BitsTransfer can give the
+            # downloaded file the server's Last-Modified date, which would make a brand new
+            # package look like the oldest one and get it pruned first.
+            $cached = Get-Item -LiteralPath $finalPath
+            $cached.LastWriteTime = Get-Date
+            Write-Log -Message "STORE      $finalPath ($([math]::Round($cached.Length / 1MB, 1)) MB)" -Color 'Green'
+        } catch {
+            Remove-Item -LiteralPath $stagingPath -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "STORE      Another machine cached $FileName first." -Color 'DarkGray'
+        }
+
+        Remove-StaleCacheEntries -Category $Category
+    } catch {
+        Write-Log -Message "STORE      Could not cache ${FileName}: $($_.Exception.Message)" -Color 'Yellow'
+    }
+}
+
+# Local, signature-verified copy of a cached installer, or $null when the cache holds no
+# usable copy and the caller must download. A cached file that fails verification is
+# deleted, so the next machine to ask gets a clean one instead of the same bad bytes.
+#
+# The installer always runs from the local temp folder and never from the share, so that
+# extraction never writes beside the cached copy.
+function Get-CachedDriverCopy {
+    param(
+        [Parameter(Mandatory)][string]$Category,
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter(Mandatory)][string]$DestinationFolder,
+        [Parameter(Mandatory)][string]$Publisher,
+        [switch]$WhatIf
+    )
+    if ($WhatIf) {
+        Write-Log -Message "WhatIf: Would look for $Category/$FileName in the cache before downloading." -Color 'Yellow'
+        return $null
+    }
+    if (-not $script:CacheEnabled) { return $null }
+
+    $cachedPath = Get-CachedDriverPath -Category $Category -FileName $FileName
+    if (-not $cachedPath) {
+        Write-Log -Message "MISS       $Category/$FileName is not cached." -Color 'DarkGray'
+        return $null
+    }
+
+    $sizeMb = [math]::Round((Get-Item -LiteralPath $cachedPath).Length / 1MB, 1)
+    Write-Log -Message "HIT        $cachedPath ($sizeMb MB)" -Color 'Green'
+
+    if (-not (Test-Path -LiteralPath $DestinationFolder)) {
+        New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null
+    }
+    $localPath = Join-Path $DestinationFolder $FileName
+    try {
+        Copy-Item -LiteralPath $cachedPath -Destination $localPath -Force -ErrorAction Stop
+        Assert-InstallerSignature -InstallerPath $localPath -ExpectedPublisher $Publisher
+        return $localPath
+    } catch {
+        Write-Log -Message "Cached $FileName is unusable: $($_.Exception.Message)" -Color 'Yellow'
+        Write-Log -Message "Discarding it and downloading from the vendor." -Color 'Yellow'
+        Remove-Item -LiteralPath $localPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $cachedPath -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+}
+
+# Last resort when the vendor version probe fails: install the newest cached package.
+# Returns $null when nothing is cached, leaving the caller to report the original failure.
+function Resolve-CachedFallbackPackage {
+    param(
+        [Parameter(Mandatory)][string]$Category,
+        [Parameter(Mandatory)][string]$DestinationFolder,
+        [Parameter(Mandatory)][string]$Publisher
+    )
+    $cachedPath = Get-NewestCachedDriverPath -Category $Category
+    if (-not $cachedPath) { return $null }
+
+    $fileName = [System.IO.Path]::GetFileName($cachedPath)
+    Write-Log -Message "FALLBACK   Version probe failed; installing newest cached package $fileName." -Color 'Yellow'
+    if (-not (Test-Path -LiteralPath $DestinationFolder)) {
+        New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null
+    }
+    $localPath = Join-Path $DestinationFolder $fileName
+    Copy-Item -LiteralPath $cachedPath -Destination $localPath -Force -ErrorAction Stop
+    Assert-InstallerSignature -InstallerPath $localPath -ExpectedPublisher $Publisher
+    return $localPath
+}
+
 # AMD's driver page, which names the current Adrenalin release and is also the Referer
 # that drivers.amd.com demands on every download.
 $script:AmdDriverPageUrl = 'https://www.amd.com/en/support/download/drivers.html'
@@ -222,23 +499,7 @@ function Get-AMDChipsetDriverInfo {
     return @{ Url = $script:AmdChipsetInstallerUrl; FileName = $fileName; Version = $version }
 }
 
-# AMD publishes no checksum alongside these downloads, so the Authenticode signature is the
-# integrity gate. Throws when the file is not validly signed by AMD.
-function Assert-AMDInstallerSignature {
-    param(
-        [Parameter(Mandatory)][string]$InstallerPath
-    )
-    $signature = Get-AuthenticodeSignature -LiteralPath $InstallerPath
-    if ($signature.Status -ne 'Valid') {
-        throw "Downloaded AMD installer failed Authenticode validation (status: $($signature.Status))."
-    }
-    if ($signature.SignerCertificate.Subject -notmatch 'Advanced Micro Devices') {
-        throw "Downloaded AMD installer is signed by an unexpected publisher: $($signature.SignerCertificate.Subject)"
-    }
-    Write-Log -Message "Signature verified: $($signature.SignerCertificate.Subject)" -Color 'Green'
-}
-
-# Download an AMD installer and verify its signature. Returns the path it was saved to.
+# Download an AMD installer. Returns the path it was saved to; the caller verifies it.
 # Why the Referer: drivers.amd.com answers direct links with a 302 to its
 # "Download Incomplete" page unless the AMD driver page is sent as the Referer.
 function Download-AMDDriver {
@@ -268,7 +529,6 @@ function Download-AMDDriver {
         $true
     } | Out-Null
 
-    Assert-AMDInstallerSignature -InstallerPath $installerPath
     Write-Log -Message "Download finished." -Color 'Green'
     return $installerPath
 }
@@ -299,7 +559,10 @@ function Install-AMDDriver {
     return 0
 }
 
-function Get-NvidiaDriverInfo {
+# Identify the installed Nvidia card and the product series ID its drivers are published
+# under. Resolved from the local PCI device ID, so it stays available when the version
+# probe cannot reach Nvidia. Returns a hashtable with Psid and GpuName.
+function Get-NvidiaProductSeries {
     param(
         [Parameter(Mandatory)]$GPU
     )
@@ -374,7 +637,16 @@ function Get-NvidiaDriverInfo {
 
     Write-Log -Message "Product series ID`t$psid" -Color 'Green'
 
-    $apiUrl = "https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup&psid=$psid&osID=57&languageCode=1033&isWHQL=1&dch=1&sort1=0&numberOfResults=1"
+    return @{ Psid = $psid; GpuName = $gpuName }
+}
+
+# Ask Nvidia for the current driver release for a product series.
+# Returns a hashtable with Version, FileName and DownloadUrl.
+function Get-NvidiaDriverInfo {
+    param(
+        [Parameter(Mandatory)][int]$Psid
+    )
+    $apiUrl = "https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php?func=DriverManualLookup&psid=$Psid&osID=57&languageCode=1033&isWHQL=1&dch=1&sort1=0&numberOfResults=1"
 
     Write-Log -Message "Checking for latest driver version..." -Color 'Green'
     try {
@@ -395,7 +667,7 @@ function Get-NvidiaDriverInfo {
 
     Write-Log -Message "Latest version`t`t$version" -Color 'Green'
 
-    return @{ Version = $version; DownloadUrl = $downloadUrl; GpuName = $gpuName }
+    return @{ Version = $version; FileName = "$version.exe"; DownloadUrl = $downloadUrl }
 }
 
 function Download-NvidiaDriver {
@@ -592,6 +864,9 @@ function Install-IntelDriver {
 }
 
 try {
+    Initialize-LogFile -Path $LogPath
+    Initialize-DriverCache -Root $CacheRoot -Disabled:$NoCache
+
     # Hardware Detection
     Write-Log -Message "Detecting hardware..." -Color 'Green'
 
@@ -637,8 +912,25 @@ try {
         $tempFolder = "$env:TEMP\AMDChipsetInstall_$([System.Guid]::NewGuid().ToString('N'))"
         Register-TempFolder $tempFolder
         try {
-            $info = Get-AMDChipsetDriverInfo
-            $installerPath = Download-AMDDriver -Url $info.Url -FileName $info.FileName -DestinationFolder $tempFolder -WhatIf:$WhatIf
+            $installerPath = $null
+            try {
+                $info = Get-AMDChipsetDriverInfo
+                $installerPath = Get-CachedDriverCopy -Category 'amd-chipset' -FileName $info.FileName -DestinationFolder $tempFolder -Publisher $script:AmdPublisher -WhatIf:$WhatIf
+                if (-not $installerPath) {
+                    $installerPath = Download-AMDDriver -Url $info.Url -FileName $info.FileName -DestinationFolder $tempFolder -WhatIf:$WhatIf
+                    if (-not $WhatIf) {
+                        Assert-InstallerSignature -InstallerPath $installerPath -ExpectedPublisher $script:AmdPublisher
+                        Save-DriverToCache -Category 'amd-chipset' -SourcePath $installerPath -FileName $info.FileName
+                    }
+                }
+            } catch {
+                Write-Log -Message "AMD chipset lookup or download failed: $($_.Exception.Message)" -Color 'Yellow'
+                if (-not $WhatIf) {
+                    $installerPath = Resolve-CachedFallbackPackage -Category 'amd-chipset' -DestinationFolder $tempFolder -Publisher $script:AmdPublisher
+                }
+                if (-not $installerPath) { throw }
+            }
+
             $exitCode = Install-AMDDriver -InstallerPath $installerPath -DriverType Chipset -WhatIf:$WhatIf
             $amdExitCodes += $exitCode
         } catch {
@@ -658,8 +950,25 @@ try {
         $tempFolder = "$env:TEMP\AMDGraphicsInstall_$([System.Guid]::NewGuid().ToString('N'))"
         Register-TempFolder $tempFolder
         try {
-            $info = Get-AMDGraphicsDriverInfo
-            $installerPath = Download-AMDDriver -Url $info.Url -FileName $info.FileName -DestinationFolder $tempFolder -WhatIf:$WhatIf
+            $installerPath = $null
+            try {
+                $info = Get-AMDGraphicsDriverInfo
+                $installerPath = Get-CachedDriverCopy -Category 'amd-graphics' -FileName $info.FileName -DestinationFolder $tempFolder -Publisher $script:AmdPublisher -WhatIf:$WhatIf
+                if (-not $installerPath) {
+                    $installerPath = Download-AMDDriver -Url $info.Url -FileName $info.FileName -DestinationFolder $tempFolder -WhatIf:$WhatIf
+                    if (-not $WhatIf) {
+                        Assert-InstallerSignature -InstallerPath $installerPath -ExpectedPublisher $script:AmdPublisher
+                        Save-DriverToCache -Category 'amd-graphics' -SourcePath $installerPath -FileName $info.FileName
+                    }
+                }
+            } catch {
+                Write-Log -Message "AMD graphics lookup or download failed: $($_.Exception.Message)" -Color 'Yellow'
+                if (-not $WhatIf) {
+                    $installerPath = Resolve-CachedFallbackPackage -Category 'amd-graphics' -DestinationFolder $tempFolder -Publisher $script:AmdPublisher
+                }
+                if (-not $installerPath) { throw }
+            }
+
             $exitCode = Install-AMDDriver -InstallerPath $installerPath -DriverType Graphics -WhatIf:$WhatIf
             $amdExitCodes += $exitCode
             Start-Sleep -Seconds 5
@@ -679,7 +988,10 @@ try {
         Write-Log -Message "Nvidia hardware detected. Proceeding with Nvidia driver installation." -Color 'Green'
 
         try {
-            $info = Get-NvidiaDriverInfo -GPU $nvidiaGpu
+            # Cached per product series: a GTX 10 machine and an RTX 50 machine need
+            # different packages, and both are kept.
+            $series = Get-NvidiaProductSeries -GPU $nvidiaGpu
+            $nvidiaCategory = "nvidia\$($series.Psid)"
 
             # Temporary folder handling (adapted from original)
             $folder = if ($LogPath -and (Split-Path -Path $LogPath -Parent)) { Split-Path -Path $LogPath -Parent } else { "$env:temp" }
@@ -687,7 +999,25 @@ try {
             Register-TempFolder $nvidiaTempFolder
             New-Item -Path $nvidiaTempFolder -ItemType Directory -Force | Out-Null
 
-            $dlFile = Download-NvidiaDriver -DownloadUrl $info.DownloadUrl -Version $info.Version -DestinationFolder $nvidiaTempFolder -WhatIf:$WhatIf
+            $dlFile = $null
+            try {
+                $info = Get-NvidiaDriverInfo -Psid $series.Psid
+                $dlFile = Get-CachedDriverCopy -Category $nvidiaCategory -FileName $info.FileName -DestinationFolder $nvidiaTempFolder -Publisher $script:NvidiaPublisher -WhatIf:$WhatIf
+                if (-not $dlFile) {
+                    $dlFile = Download-NvidiaDriver -DownloadUrl $info.DownloadUrl -Version $info.Version -DestinationFolder $nvidiaTempFolder -WhatIf:$WhatIf
+                    if (-not $WhatIf) {
+                        Assert-InstallerSignature -InstallerPath $dlFile -ExpectedPublisher $script:NvidiaPublisher
+                        Save-DriverToCache -Category $nvidiaCategory -SourcePath $dlFile -FileName $info.FileName
+                    }
+                }
+            } catch {
+                Write-Log -Message "Nvidia lookup or download failed: $($_.Exception.Message)" -Color 'Yellow'
+                if (-not $WhatIf) {
+                    $dlFile = Resolve-CachedFallbackPackage -Category $nvidiaCategory -DestinationFolder $nvidiaTempFolder -Publisher $script:NvidiaPublisher
+                }
+                if (-not $dlFile) { throw }
+            }
+
             $nvidiaExitCode = Install-NvidiaDriver -InstallerPath $dlFile -Clean:$Clean -WhatIf:$WhatIf
             Start-Sleep -Seconds 5
         } catch {
@@ -714,7 +1044,24 @@ try {
             Register-TempFolder $intelTempFolder
             New-Item -Path $intelTempFolder -ItemType Directory -Force | Out-Null
 
-            $dlFile = Download-IntelDriver -DownloadUrl $info.DownloadUrl -FileName $info.FileName -DestinationFolder $intelTempFolder -WhatIf:$WhatIf
+            $dlFile = $null
+            try {
+                $dlFile = Get-CachedDriverCopy -Category 'intel' -FileName $info.FileName -DestinationFolder $intelTempFolder -Publisher $script:IntelPublisher -WhatIf:$WhatIf
+                if (-not $dlFile) {
+                    $dlFile = Download-IntelDriver -DownloadUrl $info.DownloadUrl -FileName $info.FileName -DestinationFolder $intelTempFolder -WhatIf:$WhatIf
+                    if (-not $WhatIf) {
+                        Assert-InstallerSignature -InstallerPath $dlFile -ExpectedPublisher $script:IntelPublisher
+                        Save-DriverToCache -Category 'intel' -SourcePath $dlFile -FileName $info.FileName
+                    }
+                }
+            } catch {
+                Write-Log -Message "Intel download failed: $($_.Exception.Message)" -Color 'Yellow'
+                if (-not $WhatIf) {
+                    $dlFile = Resolve-CachedFallbackPackage -Category 'intel' -DestinationFolder $intelTempFolder -Publisher $script:IntelPublisher
+                }
+                if (-not $dlFile) { throw }
+            }
+
             $intelExitCode = Install-IntelDriver -InstallerPath $dlFile -WhatIf:$WhatIf
             Start-Sleep -Seconds 5
         } catch {
