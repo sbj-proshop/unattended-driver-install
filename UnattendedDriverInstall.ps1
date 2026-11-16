@@ -183,6 +183,7 @@ function Invoke-CurlDownload {
 $script:AmdDriverPageUrl = 'https://www.amd.com/en/support/download/drivers.html'
 $script:AmdChipsetVersionUrl = 'https://drivers.amd.com/drivers/installer/chipset/version.txt'
 $script:AmdChipsetInstallerUrl = 'https://drivers.amd.com/drivers/installer/chipset/AMD_Chipset_Software.exe'
+$script:AmdReleaseNotesUrlFormat = 'https://www.amd.com/en/resources/support-articles/release-notes/RN-RAD-WIN-{0}.html'
 
 # Read the current Adrenalin release from the AMD driver page and build the download URL
 # for the full package. Returns a hashtable with Url, FileName and Version.
@@ -203,9 +204,31 @@ function Get-AMDGraphicsDriverInfo {
     }
 
     $version = $versionMatch.Groups[1].Value
-    $fileName = "whql-amd-software-adrenalin-edition-$version-win11-c.exe"
+    $url = Get-AMDGraphicsPackageUrl -Version $version
+    $fileName = [System.IO.Path]::GetFileName($url)
     Write-Log -Message "Latest: AMD Software Adrenalin Edition $version ($fileName)" -Color 'Green'
-    return @{ Url = "https://drivers.amd.com/drivers/$fileName"; FileName = $fileName; Version = $version }
+    return @{ Url = $url; FileName = $fileName; Version = $version }
+}
+
+# Read the full-package download link for a release from its AMD release notes page.
+#
+# Why not build the file name: AMD prefixes it with "whql-" on a regular release and leaves
+# the prefix off on an Optional one (26.10.1 has it, 26.11.1 does not), and each name 404s
+# under the other form. The release notes page carries the correct link for either kind.
+function Get-AMDGraphicsPackageUrl {
+    param(
+        [Parameter(Mandatory)][string]$Version
+    )
+    $notesUrl = $script:AmdReleaseNotesUrlFormat -f ($Version -replace '\.', '-')
+    $notes = (Invoke-WithRetry -Name 'Fetch AMD release notes' -ScriptBlock { Invoke-CurlWeb $notesUrl -Referer $script:AmdDriverPageUrl }) -join "`n"
+
+    $linkPattern = 'https://drivers\.amd\.com/drivers/[A-Za-z0-9._-]*adrenalin-edition-' +
+        [regex]::Escape($Version) + '-win11-c\.exe'
+    $linkMatch = [regex]::Match($notes, $linkPattern, 'IgnoreCase')
+    if (-not $linkMatch.Success) {
+        throw "Could not find the win11-c package link for $Version on $notesUrl."
+    }
+    return $linkMatch.Value
 }
 
 # Read the current chipset driver version from AMD's plain-text version file.
